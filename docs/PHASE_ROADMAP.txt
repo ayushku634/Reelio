@@ -1,0 +1,171 @@
+
+??
+Reelio
+Phase Roadmap & Implementation Guide
+Version 1.0 · ROADMAP
+Reelio Chrome Extension
+
+
+Overview
+The project is divided into 4 phases. Each phase produces a working, testable build. Later phases build on earlier ones without requiring rewrites. A coding agent should complete each phase fully and run its verification checklist before starting the next.
+
+PhaseNameDeliverableEst. Effort1Foundation & InterceptionExtension installs, intercepts GraphQL, logs raw reel data to console2-3 days2Enrichment PipelineEvery intercepted reel gets transcript + metadata tags + stored to IndexedDB3-4 days3Search EnginePopup with working semantic search over indexed reels3-4 days4Vision + PolishVisual frame analysis, settings panel, storage meter, Chrome Web Store ready3-4 days
+
+Phase 1 - Foundation & Interception
+Goal
+Prove the interception works. By end of Phase 1, navigating to https://www.instagram.com/ayush.hs26/saved/all-posts/ and scrolling should produce clean, structured reel data logged to the Service Worker console.
+1.1 Tasks
+1. Scaffold extension project with webpack + MV3 manifest (permissions: scripting, storage)
+2. Create public/page-interceptor.js - patches window.fetch + XHR in Instagram's JS context, dispatches CustomEvent("reelioApi")
+3. Create content.js - injects page-interceptor.js via chrome.runtime.getURL + <script> tag, listens for reelioApi CustomEvents, relays to background via chrome.runtime.sendMessage
+4. Declare public/page-interceptor.js in web_accessible_resources in manifest.json
+5. Create interceptor.js in background - receives API_PAYLOAD messages, parses JSON, fingerprints saved reel responses
+6. Implement isSavedReelsResponse() - structural duck-typing, NOT doc_id matching
+7. Implement in-memory deduplication Set in background.js
+8. Log extracted reel objects to Service Worker console (chrome://serviceworker-internals)
+9. Verify all key fields present: shortcode, thumbnailUrl, caption, ccUrl, audioTitle, creatorUsername
+
+1.2 Key Technical Notes for Coding Agent
+Critical: 3-Layer Architecture - Do NOT skip this
+Content scripts run in an ISOLATED world. They cannot patch window.fetch as Instagram sees it. You MUST use the 3-layer approach:  Layer 1 - public/page-interceptor.js:   Runs in Instagram page context. Patches fetch + XHR.   Dispatches CustomEvent("reelioApi") with data.  Layer 2 - content.js:   Injects page-interceptor.js as a <script> tag.   Listens for CustomEvent, relays via chrome.runtime.sendMessage.  Layer 3 - background.js:   Receives messages, parses, deduplicates, runs pipeline.  Attempting to patch fetch directly in content.js will silently fail.
+Critical: web_accessible_resources
+page-interceptor.js MUST be declared in manifest.json under web_accessible_resources, otherwise chrome.runtime.getURL() returns a blocked URL and the injection silently fails.  "web_accessible_resources": [{   "resources": ["public/page-interceptor.js", ...],   "matches": ["https://www.instagram.com/*"] }]
+Critical: Idempotency Guard in page-interceptor.js
+content.js runs at document_start on every navigation. Without a guard, page-interceptor.js could be injected multiple times.  // First line of page-interceptor.js: if (window.__reelioInterceptor) return; window.__reelioInterceptor = true;
+Critical: Response Cloning in page-interceptor.js
+Response body can only be consumed once. ALWAYS clone before reading. Return the ORIGINAL to Instagram - never the clone.  const cloned = resp.clone(); const text = await cloned.text(); // dispatch CustomEvent with text return resp; // original goes back to Instagram
+Critical: Silent Failure Everywhere
+Wrap ALL interception code in try/catch. The extension must never break normal Instagram browsing. Every error is swallowed silently.  try {   const text = await cloned.text();   window.dispatchEvent(new CustomEvent("reelioApi", { detail: {...} })); } catch (e) { /* silent */ }
+Target URL
+The saved reels collection for this install is: https://www.instagram.com/ayush.hs26/saved/all-posts/  The fingerprinting function should check that the intercepted request originates while this URL is active (check sender.tab.url in background.js). This prevents processing GraphQL calls from other Instagram pages.
+1.3 Verification Checklist
+• Extension loads without errors in chrome://extensions
+• No console errors on instagram.com after installing extension
+• Navigating to instagram.com/ayush.hs26/saved/all-posts/ and scrolling triggers log entries in Service Worker console
+• Scrolling loads more reels and triggers more log entries
+• Each log entry contains: id, shortcode, thumbnailUrl, caption, creatorUsername, ccUrl, audioTitle
+• ccUrl is a valid https:// URL pointing to a .vtt file
+• Navigating to Instagram DMs, feed, or explore does NOT trigger spurious log entries
+• Extension does not break normal Instagram browsing, posting, or DMs
+• Refreshing the page does not cause duplicate interception on the same reels (dedup Set works)
+
+
+Phase 2 - Enrichment Pipeline & Storage
+Goal
+Every intercepted reel is enriched and persisted to IndexedDB. By end of Phase 2, the extension badge shows a live count of indexed reels, and the full ReelDocument for each is queryable from IndexedDB via DevTools.
+2.1 Tasks
+10. Implement cc-fetcher.js - fetch .vtt URL from Service Worker, parse to clean string
+11. Implement metadata-tagger.js - category detection, audio signal classification
+12. Implement document-builder.js - assemble ReelDocument from all enrichment layers
+13. Implement db.js - promise-based IndexedDB wrapper with all stores
+14. Implement tier-manager.js - enforce Tier 1 limit, demote oldest to Tier 2
+15. Wire pipeline in background.js: intercept ? enrich ? store
+16. Update extension badge with current Tier 1 document count
+17. Handle duplicate reels: upsert, do not create duplicates
+18. Load and persist user settings (tierLimit default 200, visionEnabled default false)
+
+2.2 Key Technical Notes for Coding Agent
+IndexedDB Stores to Create on DB Init
+const DB_NAME = "reelio-db"; const DB_VERSION = 1;  onupgradeneeded: (event) => {   const db = event.target.result;   db.createObjectStore("reel_documents", { keyPath: "id" });   db.createObjectStore("reel_tombstones", { keyPath: "id" });   db.createObjectStore("embeddings", { keyPath: "id" });   db.createObjectStore("settings", { keyPath: "key" }); }
+CC URL Fetch Must Be in Service Worker
+Fetching the .vtt URL from a content script will hit CORS restrictions. Make the fetch() call inside background.js (Service Worker context). The host_permission for *.cdninstagram.com/* in manifest.json grants this access.
+Tier Manager Logic
+On each new document write: 1. Check current Tier 1 count from db.getDocumentCount() 2. If count >= tierLimit:    a. Find oldest document by savedAt timestamp    b. Write tombstone for it to reel_tombstones store    c. Delete its full document from reel_documents    d. Delete its embedding from embeddings store 3. Write new document and its embedding
+2.3 Verification Checklist
+• Extension badge shows incrementing count as user scrolls Saved Reels
+• Open DevTools ? Application ? IndexedDB ? reel_documents store contains entries
+• Each entry has transcript field populated (non-null) for reels with auto-captions
+• Each entry has categories array with at least one category
+• Scrolling past the tier limit causes oldest documents to be demoted (verify in tombstones store)
+• Reloading Chrome and re-opening popup shows same count - data persisted correctly
+• Same reel scrolled twice does not create duplicate entry
+
+
+Phase 3 - Search Engine & Popup UI
+Goal
+A working search experience. User types a query in the popup and sees ranked reel results with thumbnails and match scores. This is the core value of the product.
+3.1 Tasks
+19. Create embedding-worker.js - load transformers.js + all-MiniLM-L6-v2, implement EMBED message handler
+20. Implement search.js - cosine similarity search, returns ranked results
+21. Implement keyword-fallback.js - simple text search for Tier 2 tombstones
+22. Create popup.html + popup.css - search bar, result cards, top-N selector
+23. Create popup.js - wire search input to background.js message, render results
+24. Implement ResultCard component - thumbnail, creator, snippet, category, score, Open button
+25. Add 300ms debounce to search input
+26. Show model loading state on first launch (one-time download indicator)
+27. Persist user's topN preference in settings store
+28. Show Tier 2 partial matches section below main results
+
+3.2 Key Technical Notes for Coding Agent
+Embedding Worker - Keep Alive Pattern
+Service Workers in MV3 are ephemeral - they sleep after ~30 seconds of inactivity. The embedding worker must be re-spawned if the SW wakes up cold.  In background.js: let embeddingWorker = null; function getEmbeddingWorker() {   if (!embeddingWorker) {     embeddingWorker = new Worker(chrome.runtime.getURL("embedding-worker.js"));   }   return embeddingWorker; }
+Text to Embed - Concatenation Order Matters
+Order fields from most to least discriminative for best search quality:  const textToEmbed = [   doc.transcript,                         // highest signal   doc.visualDescription,                  // high signal   `Creator: ${doc.creator.username}`,   `Category: ${doc.categories.join(", ")}`,   `Audio: ${doc.audio.title}`,   doc.caption,   doc.hashtags.join(" "), ].filter(Boolean).join("\n");  // Truncate to 512 tokens (model max). ~2000 characters is safe.
+Score Display
+Raw cosine similarity ranges from -1 to 1. For display: const displayScore = Math.round(((score + 1) / 2) * 100); // Maps [-1,1] to [0,100] as a percentage // Only show results above threshold, e.g. displayScore > 40
+3.3 Verification Checklist
+• Popup opens cleanly with no errors in popup DevTools console
+• First launch shows "Setting up search engine..." progress, then disappears
+• Typing a query returns results within 500ms
+• Results show thumbnail image, creator username, caption snippet, category badge, score %
+• Clicking Open navigates to the correct Instagram reel URL
+• Top N selector (3/5/10/20) changes number of results shown and persists after popup close
+• Search for a phrase from a known reel's transcript returns that reel in top 3
+• Search for a description of what's visually in a reel (without caption words) returns correct reel
+
+
+Phase 4 - Vision, Settings & Polish
+Goal
+Production-ready extension. Vision analysis adds visual grounding to search. Settings panel gives users control. Build passes Chrome Web Store review requirements.
+4.1 Tasks
+29. Create vision-worker.js - load Moondream2 via WASM, implement frame description
+30. Add vision opt-in prompt on first launch (consent before 1.8GB download)
+31. Implement frame URL extraction from CDN thumbnail URL patterns
+32. Add vision queue in background.js - process reels with FIFO worker queue
+33. Update ReelDocument in IndexedDB when visual description is ready, recompute embedding
+34. Build SettingsPanel component in popup
+35. Add tier limit slider (50-500, default 200) to settings
+36. Add storage meter to settings - show bytes used / estimated max
+37. Add "Clear All Data" button with confirmation dialog
+38. Add vision queue status indicator: "Visual analysis: 8 reels queued"
+39. Add onboarding card for first-time users
+40. Create extension icons (16px, 48px, 128px)
+41. Final manifest audit - minimum required permissions, accurate description
+42. Test on Chrome, Edge, Brave
+
+4.2 Key Technical Notes for Coding Agent
+Moondream2 WASM Loading
+Moondream2 must be bundled as a WASM binary via webpack. Do NOT attempt to load it from an external CDN - MV3 CSP blocks this.  In webpack.config.js: experiments: { asyncWebAssembly: true }  The 1.8GB model weights are cached to chrome.storage after first download. Use a streaming download with progress events to show % complete in popup.
+Re-embedding After Vision
+When Moondream2 finishes describing a reel's frames: 1. Update doc.visualDescription in IndexedDB 2. Rebuild the text concatenation (now includes visual description) 3. Re-embed the new text via Embedding Worker 4. Overwrite the embedding record in IndexedDB  This upgrades the search vector for that reel silently in the background.
+Chrome Web Store Requirements
+• Privacy policy URL required (even for a free extension) • Justify every permission in the store listing description • host_permissions must be minimally scoped • No remote code execution (all JS must be in the extension package) • Screenshots: 1280x800 or 640x400, at least 1 required • One-time developer registration: $5 USD
+4.3 Verification Checklist
+• Vision opt-in prompt shown on first launch - decline works, accept triggers download with progress
+• After vision model downloads, new reels get visual descriptions within 30 seconds of indexing
+• Search for a visual element (e.g. "wooden desk with journal") returns correct reel
+• Settings panel opens/closes cleanly from gear icon
+• Tier limit slider saves and takes effect - changing to 50 demotes excess documents
+• Storage meter reflects actual IndexedDB usage
+• Clear All Data removes all IndexedDB records and resets badge to 0
+• Extension loads correctly in Edge and Brave without modification
+• chrome://extensions shows no warnings or errors
+• Extension package size (excluding model cache) is under 5MB
+
+
+Cross-Phase Notes for Coding Agent
+What NOT to Do
+• Do not store any data on a server or external database - local only
+• Do not make any API calls to paid services - the entire pipeline must be free
+• Do not use localStorage - use IndexedDB for all reel data and chrome.storage.local for settings
+• Do not inject UI overlays into Instagram pages - popup only
+• Do not attempt to download Instagram videos - thumbnails and CC text only
+• Do not hardcode Instagram's GraphQL doc_id values - use structural fingerprinting
+
+Testing Approach
+• Unit test all pure functions: interceptor.js, metadata-tagger.js, search.js cosine similarity
+• Manual integration testing: install unpacked extension, scroll Saved Reels, verify in DevTools
+• Search quality testing: save 20 diverse reels, run 10 representative queries, verify top-3 recall
+
+Known Risks & Mitigations
+RiskMitigationInstagram changes GraphQL structureUse structural fingerprinting not doc_id. Easy config update if needed.CC URLs expire before fetchFetch CC immediately after interception in same pipeline step. CDN URLs are valid for hours.MV3 Service Worker sleep kills workersLazy re-spawn workers on demand using getEmbeddingWorker() pattern.Moondream2 too slow on low-end hardwareVision is opt-in. Clearly communicate hardware requirements in consent prompt.Instagram blocks CDN fetches from extensionUse host_permission for cdninstagram.com. If blocked, CC layer degrades gracefully.

@@ -1,0 +1,82 @@
+
+??
+Reelio
+Technical Architecture Document
+Version 1.0 · ARCH
+Reelio Chrome Extension
+
+
+1. Repository Structure
+Project File Tree
+reelio/ +-- manifest.json                  # Extension manifest (MV3) +-- package.json +-- webpack.config.js              # Bundles workers and popup ¦ +-- public/ ¦   +-- page-interceptor.js        # Injected into PAGE context (not isolated world) ¦                                  # Declared in web_accessible_resources ¦ +-- src/ ¦   +-- content/ ¦   ¦   +-- content.js             # Injects page-interceptor.js, relays CustomEvents ¦   ¦ ¦   +-- background/ ¦   ¦   +-- background.js          # Service Worker - orchestrator ¦   ¦   +-- pipeline/ ¦   ¦   ¦   +-- interceptor.js     # GraphQL response parser / fingerprinter ¦   ¦   ¦   +-- cc-fetcher.js      # .vtt subtitle fetcher & parser ¦   ¦   ¦   +-- metadata-tagger.js # Rule-based category/audio tagger ¦   ¦   ¦   +-- document-builder.js # Assembles final ReelDocument ¦   ¦   +-- storage/ ¦   ¦   ¦   +-- db.js              # IndexedDB wrapper (promise-based) ¦   ¦   ¦   +-- tier-manager.js    # Handles Tier 1/2 promotion/demotion ¦   ¦   +-- search/ ¦   ¦       +-- search.js          # Cosine similarity search engine ¦   ¦       +-- keyword-fallback.js # Fallback for Tier 2 results ¦   ¦ ¦   +-- workers/ ¦   ¦   +-- embedding-worker.js    # transformers.js + MiniLM model ¦   ¦   +-- vision-worker.js       # Moondream2 vision model ¦   ¦ ¦   +-- popup/ ¦       +-- popup.html ¦       +-- popup.js ¦       +-- popup.css ¦       +-- components/ ¦           +-- SearchBar.js ¦           +-- ResultCard.js ¦           +-- SettingsPanel.js ¦ +-- assets/ ¦   +-- icons/                     # 16, 48, 128px extension icons ¦ +-- tests/     +-- interceptor.test.js     +-- metadata-tagger.test.js     +-- search.test.js
+2. Manifest V3 Configuration
+manifest.json (complete)
+{   "manifest_version": 3,   "name": "Reelio",   "version": "1.0.0",   "permissions": [     "scripting",     "storage"   ],   "host_permissions": [     "https://www.instagram.com/*",     "https://*.cdninstagram.com/*"   ],   "background": {     "service_worker": "background.js",     "type": "module"   },   "content_scripts": [{     "matches": ["https://www.instagram.com/*"],     "js": ["content.js"],     "run_at": "document_start"   }],   "action": {     "default_popup": "popup.html",     "default_icon": "assets/icons/48.png"   },   "web_accessible_resources": [{     "resources": [       "public/page-interceptor.js",  // PAGE CONTEXT injection       "embedding-worker.js",       "vision-worker.js"     ],     "matches": ["https://www.instagram.com/*"]   }] }
+Why "scripting" permission?
+"scripting" is required alongside "storage" in MV3. The page-interceptor.js file must be declared under web_accessible_resources so content.js can load it via chrome.runtime.getURL() and inject it as a <script> tag into the Instagram page DOM. This is the only compliant way in MV3 to run code in the page's JavaScript context (not the isolated content script world). The transformers.js and Moondream2 WASM binaries must also be bundled via webpack - they cannot be loaded from external CDNs at runtime due to MV3 CSP restrictions.
+3. Module Specifications
+3.1 public/page-interceptor.js
+This is the most critical file. It runs in Instagram's own JavaScript context (not the isolated content script world) and patches window.fetch and XMLHttpRequest. It is NOT bundled by webpack - it is served as a static file from public/ and injected via a <script> tag by content.js.
+• IIFE with idempotency guard (window.__reelioInterceptor) - safe to re-inject
+• Patches window.fetch - clones response before reading, returns original to Instagram
+• Patches XMLHttpRequest.prototype.open and .send - captures response on load event
+• Dispatches CustomEvent("reelioApi") with { url, body, status } - bridges to content script
+• Filters only URLs containing "/graphql" or "/api/" before dispatching
+• All errors silently swallowed - never throws, never breaks Instagram
+• Total size target: under 3KB unminified
+
+3.2 content.js
+Injected at document_start. Two responsibilities only: (1) inject page-interceptor.js into the page, (2) relay CustomEvents from page context to background Service Worker.
+• Injects public/page-interceptor.js via document.createElement("script") into document.head
+• Script URL obtained via chrome.runtime.getURL("public/page-interceptor.js")
+• Listens for window CustomEvent("reelioApi")
+• On event: chrome.runtime.sendMessage({ type: "API_PAYLOAD", payload: evt.detail }) - fire and forget
+• No business logic, no parsing - pure relay layer
+• Total size target: under 1KB
+
+3.2 interceptor.js
+Pure function module. Takes raw GraphQL JSON, returns array of raw reel objects or empty array.
+• Uses structural duck-typing to identify saved reel responses
+• Normalises nested GraphQL edge/node structure into flat reel array
+• Extracts: id, shortcode, video_url, thumbnail_url, accessibility_caption, video_subtitles_uri, owner, caption, audio_track, hashtags, taken_at
+• Returns [] for any unrecognised response shape - never throws
+
+3.3 cc-fetcher.js
+Async module. Takes a .vtt URL, returns clean transcript string or null.
+.vtt Parsing Logic
+1. fetch(vttUrl) ? raw text 2. Split by line 3. Filter out: "WEBVTT" header, timestamp lines (regex: /\d{2}:\d{2}/), blank lines 4. Join remaining lines with space 5. Deduplicate consecutive duplicate phrases (common in auto-captions) 6. Trim and return
+3.4 metadata-tagger.js
+Pure synchronous function. Takes raw reel object, returns enriched metadata fields.
+Category detection uses keyword dictionaries per category:
+CategoryKeyword SignalsFitnessgym, workout, exercise, training, reps, sets, squat, deadlift, cardio, running, yoga, pilatesNutritionrecipe, cook, food, eat, meal, calories, protein, ingredient, kitchen, bakeProductivityroutine, habit, morning, focus, deep work, journaling, planning, schedule, systemFinancemoney, invest, budget, savings, stock, crypto, income, passive, wealthTraveltravel, trip, visit, hotel, flight, country, city, explore, adventure, destinationTechcoding, app, software, tool, AI, developer, build, tech, product, startupMental Healthanxiety, stress, therapy, mindfulness, meditation, mental health, burnout, healingDIY / CraftDIY, craft, build, make, tutorial, how to, step by step, create
+Audio signal classification:
+• isOriginalAudio: audio.title starts with "Original Audio" - creator is speaking, high-info reel
+• isTalkingHead: isOriginalAudio AND duration < 90s - very likely tutorial/advice content
+• isAesthetic: known lo-fi/ambient track names OR no speech detected in CC
+
+3.5 db.js
+Promise-based IndexedDB wrapper. Exposes clean async API hiding all IDBRequest callback complexity.
+Public API
+db.getDocument(id)         ? Promise<ReelDocument | null> db.putDocument(doc)        ? Promise<void> db.getAllDocuments()       ? Promise<ReelDocument[]> db.putTombstone(t)         ? Promise<void> db.getEmbedding(id)        ? Promise<EmbeddingRecord | null> db.putEmbedding(rec)       ? Promise<void> db.getAllEmbeddings()      ? Promise<EmbeddingRecord[]> db.getDocumentCount()      ? Promise<number> db.clearAll()              ? Promise<void>
+3.6 embedding-worker.js
+Worker Message Protocol
+// Main thread ? Worker: { type: "EMBED", id: "req-1", text: "morning routine no phone..." }  // Worker ? Main thread: { type: "EMBED_RESULT", id: "req-1", vector: Float32Array(384) } { type: "EMBED_ERROR", id: "req-1", error: "Model not loaded" } { type: "MODEL_READY" }   // Fired once after model loads
+3.7 search.js
+Core search logic. Called by background.js message handler.
+1. Receive query string
+2. Post to Embedding Worker: { type: "EMBED", text: query }
+3. Await EMBED_RESULT ? queryVector (Float32Array)
+4. Load all EmbeddingRecords from db.getAllEmbeddings()
+5. For each record: score = cosineSimilarity(queryVector, record.vector)
+6. Sort by score descending
+7. Take top N (from user settings)
+8. Load corresponding ReelDocuments from IndexedDB
+9. Return array of {document, score} sorted by score
+
+4. Build & Tooling
+ToolPurposeConfigwebpack 5Bundle content.js, background.js, workers, popup into separate entry pointswebpack.config.js with 5 entry pointsBabelTranspile modern JS for Chrome compatibility.babelrc with @babel/preset-envtransformers.jsEmbedding model inference in browsernpm: @xenova/transformersJestUnit tests for pure modules (interceptor, tagger, search)jest.config.jsweb-extLocal development - hot reload extension in Chromenpm run dev
+5. Message Passing Architecture
+All cross-context communication uses chrome.runtime.sendMessage with typed message objects:
+Message TypeFromToPayloadREELS_BATCHcontent.jsbackground.js{ reels: RawReel[] }SEARCHpopup.jsbackground.js{ query: string, topN: number }SEARCH_RESULTSbackground.jspopup.js{ results: SearchResult[] }GET_STATSpopup.jsbackground.js{}STATSbackground.jspopup.js{ total: number, tier1: number, storageBytes: number }UPDATE_SETTINGSpopup.jsbackground.js{ tierLimit: number, visionEnabled: boolean }VISION_QUEUE_STATUSbackground.jspopup.js{ remaining: number }
+6. Dependencies
+PackageVersionSizePurpose@xenova/transformers^2.x~800KB (JS)Browser ML inference runtimeall-MiniLM-L6-v2via HF CDN25MB (model)Text embedding modelMoondream2via WASM1.8GB (model)Vision/image description modelwebpack^5.xdevDepExtension bundlerjest^29.xdevDepUnit testingweb-ext^7.xdevDepExtension dev runner

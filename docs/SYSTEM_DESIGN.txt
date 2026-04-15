@@ -1,0 +1,110 @@
+
+??
+Reelio
+System Design Document
+Version 1.0 · SYS
+Reelio Chrome Extension
+
+
+1. System Overview
+Reelio is a fully client-side system. There is no backend, no server, no cloud database. Every component - data collection, enrichment, storage, embedding, and search - runs inside the user's Chrome browser. The only outbound network calls are to Instagram's own CDN (to fetch .vtt subtitle files and thumbnail images, which the browser would fetch anyway during normal use).
+
+Architecture Principle
+Local-first. The system is designed so that once the one-time model downloads are complete, the extension works with zero network dependency. Search is fully offline. This is both a privacy guarantee and a performance guarantee.
+2. Component Architecture
+2.1 Chrome Extension Structure
+The extension consists of four distinct execution contexts, each with a specific role:
+
+ContextFileRolePermissionsContent Scriptcontent.jsInjected into instagram.com. Monkey-patches fetch/XHR to intercept GraphQL responses. Forwards reel data to Service Worker via chrome.runtime.sendMessage.Access to instagram.com DOM and networkService Workerbackground.jsReceives intercepted data. Orchestrates enrichment pipeline. Manages IndexedDB reads/writes. Computes embeddings by posting to Embedding Worker.chrome.storage, IndexedDB, fetch to CDNEmbedding Workerembedding-worker.jsDedicated Web Worker. Loads transformers.js + all-MiniLM-L6-v2 model. Computes embeddings on demand. Responds to postMessage calls from Service Worker.WebAssembly, file system (model cache)Vision Workervision-worker.jsDedicated Web Worker. Loads Moondream2 via WebAssembly. Processes queued thumbnail frames. Returns text descriptions.WebAssembly, Canvas APIPopuppopup.html/jsUI layer. Sends search queries to Service Worker. Renders results. Manages settings.chrome.runtime messaging
+2.2 Data Flow Diagram
+The following describes the complete flow from Instagram page load to searchable indexed reel:
+
+Collection Flow
+Instagram Page loads   ? content.js monkey-patches window.fetch   ? User scrolls Saved Reels folder   ? Instagram calls graphql/query (intercepted)   ? content.js extracts reel array from JSON response   ? chrome.runtime.sendMessage({type: "REELS_BATCH", reels: [...]})   ? background.js receives batch   ? For each reel: enrichment pipeline runs   ? Document written to IndexedDB   ? Embedding computed via Embedding Worker   ? Vector stored in IndexedDB alongside document   ? Extension badge count updated
+Search Flow
+User types query in popup   ? 300ms debounce fires   ? popup.js sends chrome.runtime.sendMessage({type: "SEARCH", query: "..."})   ? background.js receives query   ? Embeds query via Embedding Worker (~100ms)   ? Loads all stored vectors from IndexedDB   ? Computes cosine similarity for each vector (pure JS, ~5ms for 500)   ? Sorts by score, returns top N   ? Popup renders results
+3. Data Models
+3.1 ReelDocument (Tier 1 - Full Context)
+IndexedDB Store: reel_documents
+Key: reel_id (string - Instagram shortcode)  {   id: string,                    // Instagram shortcode e.g. "C8xKj2aP3bQ"   url: string,                   // https://instagram.com/reels/{id}   thumbnailUrl: string,          // CDN URL for cover frame   creator: {     username: string,     displayName: string,   },   caption: string,               // Full untruncated caption   hashtags: string[],            // Pre-parsed array from GraphQL   audio: {     title: string,     artist: string,     isOriginal: boolean,         // true if "Original Audio - @creator"   },   transcript: string | null,     // Cleaned .vtt content, null if unavailable   visualDescription: string | null, // Moondream2 output, null if not run   categories: string[],          // e.g. ["Fitness", "Productivity"]   savedAt: number,               // Unix timestamp   indexedAt: number,             // When extension processed this reel   tier: 1, }
+3.2 ReelTombstone (Tier 2 - Lightweight)
+IndexedDB Store: reel_tombstones
+Key: reel_id (string)  {   id: string,   url: string,   thumbnailUrl: string,   creatorUsername: string,   categories: string[],   savedAt: number,   tier: 2, }
+3.3 EmbeddingRecord
+IndexedDB Store: embeddings
+Key: reel_id (string)  {   id: string,   vector: Float32Array,          // 384 dimensions from all-MiniLM-L6-v2   textUsed: string,              // The concatenated text that was embedded }
+3.4 Text Concatenation for Embedding
+The text fed to the embedding model is a structured concatenation of all available signals:
+Embedding Input Template
+Creator: {username} {displayName} Category: {categories.join(", ")} Audio: {audio.title} by {audio.artist} Caption: {caption} Hashtags: {hashtags.join(" ")} Transcript: {transcript} Visual: {visualDescription}
+4. Network Interception Design
+4.1 Three-Layer Architecture (Page ? Content ? Background)
+Reelio uses a 3-layer interception architecture. This is the correct approach for Chrome MV3 because content scripts run in an isolated world - they cannot directly access or patch window.fetch as seen by Instagram's own JavaScript. The solution is to inject a separate page-context script that runs in Instagram's JavaScript environment.
+
+Architecture Flow
++- Page Context (public/page-interceptor.js) -+ ¦  Patches window.fetch + XMLHttpRequest       ¦ ¦  Dispatches CustomEvent("reelioApi") w/ data ¦ +---------------------------------------------+                       ¦                       ? +- Content Script (content.js) ---------------+ ¦  Injects page-interceptor.js via <script>   ¦ ¦  Listens for CustomEvents, forwards to BG   ¦ +---------------------------------------------+                       ¦                       ? +- Background Service Worker (background.js) -+ ¦  Parses JSON, deduplicates, runs pipeline,  ¦ ¦  writes to IndexedDB, updates badge         ¦ +---------------------------------------------+
+4.2 Why a Page-Injected Script (Not Direct Content Script Patching)
+Content scripts in Chrome MV3 operate in an "isolated world" - they share the DOM with the page but have a completely separate JavaScript environment. This means window.fetch in a content script is NOT the same fetch Instagram calls. Patching it there would intercept nothing from Instagram's own network calls.
+The solution: inject a .js file from web_accessible_resources directly into the page's <head> as a <script> tag. This file runs in the page's JavaScript context and can successfully patch window.fetch and XMLHttpRequest as Instagram sees them.
+
+page-interceptor.js - Runs in Page Context
+(function () {   if (window.__reelioInterceptor) return; // idempotent guard   window.__reelioInterceptor = true;    // -- Patch fetch --   const originalFetch = window.fetch;   window.fetch = async function (input, init) {     const resp = await originalFetch.apply(this, arguments);     try {       const url = typeof input === "string" ? input : input.url || "";       if (url.includes("/graphql") || url.includes("/api/")) {         const cloned = resp.clone(); // CRITICAL: clone before reading         const text = await cloned.text();         window.dispatchEvent(new CustomEvent("reelioApi", {           detail: { url, body: text, status: resp.status }         }));       }     } catch (e) { /* silent - never break Instagram */ }     return resp; // return ORIGINAL to Instagram   };    // -- Patch XHR (Instagram uses both) --   const origOpen = XMLHttpRequest.prototype.open;   const origSend = XMLHttpRequest.prototype.send;   XMLHttpRequest.prototype.open = function (method, url) {     this._reelioUrl = url;     return origOpen.apply(this, arguments);   };   XMLHttpRequest.prototype.send = function () {     this.addEventListener("load", function () {       if (this._reelioUrl?.includes("/graphql")) {         window.dispatchEvent(new CustomEvent("reelioApi", {           detail: { url: this._reelioUrl, body: this.responseText, status: this.status }         }));       }     });     return origSend.apply(this, arguments);   }; })();
+content.js - Bridges Page Context to Extension
+// Step 1: Inject the page-context interceptor script const scriptUrl = chrome.runtime.getURL("public/page-interceptor.js"); const script = document.createElement("script"); script.src = scriptUrl; script.type = "text/javascript"; document.head.appendChild(script);  // Step 2: Listen for intercepted API data and relay to Service Worker window.addEventListener("reelioApi", (evt) => {   chrome.runtime.sendMessage({ type: "API_PAYLOAD", payload: evt.detail }); });
+4.3 Manifest Changes Required for This Pattern
+The page-interceptor.js file must be declared as a web_accessible_resource so the content script can inject it via chrome.runtime.getURL(). The "scripting" permission is also needed.
+manifest.json additions
+"permissions": ["scripting", "storage"], "host_permissions": [   "https://www.instagram.com/*",   "https://*.cdninstagram.com/*" ], "web_accessible_resources": [{   "resources": ["public/page-interceptor.js"],   "matches": ["https://www.instagram.com/*"] }]
+4.4 Response Fingerprinting (isSavedReelsResponse)
+The background script must identify which intercepted responses contain saved reel data. Use structural duck-typing - NOT Instagram's internal doc_id (which changes frequently). The target URL for Reelio is https://www.instagram.com/ayush.hs26/saved/all-posts/
+• Check URL contains "/graphql" AND current tab URL matches instagram.com/ayush.hs26/saved/
+• Check parsed JSON contains an edges array whose nodes have shortcode or video_url fields
+• Check nodes contain accessibility_caption or video_subtitles_uri (signals reel content)
+• Return [] for any unrecognised shape - never throw
+
+Background: deduplicate and process
+const processedIds = new Set(); // in-memory dedup within session  chrome.runtime.onMessage.addListener((msg, sender) => {   if (msg.type === "API_PAYLOAD") {     try {       const json = JSON.parse(msg.payload.body);       const reels = extractReels(json); // returns RawReel[]       const newReels = reels.filter(r => !processedIds.has(r.id));       newReels.forEach(r => processedIds.add(r.id));       if (newReels.length) runEnrichmentPipeline(newReels);     } catch (e) { /* non-JSON or irrelevant - silent */ }   } });
+4.5 CC File Fetching
+Once a reel's .vtt subtitle URL is extracted from the GraphQL response, the Service Worker fetches it directly:
+• Fetch is made from Service Worker context (not content script) to avoid CORS issues
+• cdninstagram.com host_permission in manifest grants this access
+• Response is plain text - parse by stripping timestamp lines and joining cue text
+• If fetch fails (expired CDN URL, missing captions), transcript field is set to null - graceful degradation
+
+5. Embedding & Search Design
+5.1 Model Loading
+• transformers.js loaded as ES module in Embedding Worker
+• Model all-MiniLM-L6-v2 downloaded from Hugging Face CDN on first use
+• Cached to browser cache storage after first download - subsequent loads are instant
+• Worker remains alive across popup open/close cycles via Service Worker keep-alive ping
+
+5.2 Cosine Similarity Implementation
+Pure JS cosine similarity - no library needed
+function cosineSimilarity(a, b) {   let dot = 0, magA = 0, magB = 0;   for (let i = 0; i < a.length; i++) {     dot += a[i] * b[i];     magA += a[i] * a[i];     magB += b[i] * b[i];   }   return dot / (Math.sqrt(magA) * Math.sqrt(magB)); }
+5.3 Search Complexity
+For 500 reels with 384-dimension vectors: 500 × 384 = 192,000 multiply-add operations. This completes in under 5ms on any modern CPU. Linear scan is perfectly adequate at this scale - no approximate nearest neighbour index (HNSW etc.) is needed.
+
+6. Vision Pipeline Design
+6.1 Frame Extraction
+• Three frame URLs are derived from the reel's CDN thumbnail URL pattern
+• Cover frame (00:00) - always available as the poster image
+• Mid-reel frame - fetched from CDN if URL pattern supports it
+• Late frame - fetched from CDN if URL pattern supports it
+• Fallback: if only cover frame available, single-frame analysis still runs
+
+6.2 Moondream2 Prompt
+Vision Prompt Template
+Describe what is shown in this Instagram Reel frame. Be specific about: - The setting (indoor/outdoor, location type) - What the person is doing or showing - Any visible objects, food, equipment, text on screen - The overall vibe and aesthetic Keep your description to 2-3 sentences. Write as if helping someone remember why they saved this reel.
+6.3 Queue Management
+• Vision processing runs in a FIFO queue in the Vision Worker
+• New reels are appended to the queue as they are indexed
+• Queue persists in memory - if popup closes, processing continues in Service Worker
+• Processed reels have their visualDescription field updated in IndexedDB
+• Queue depth shown in settings panel: "Visual analysis: 12 reels remaining"
+
+7. Storage Architecture
+Store NameKeyValueMax Sizereel_documentsreel_idFull ReelDocument JSON~10KB × N reelsreel_tombstonesreel_idLightweight tombstone JSON~200B × all reelsembeddingsreel_idFloat32Array (384 dims)~1.5KB × N reelssettingskey stringUser preferencesNegligible
+Storage Budget (Default 200 reels)
+reel_documents: 200 × 10KB = 2MB reel_tombstones: 2000 × 200B = 400KB (lifetime accumulation) embeddings: 200 × 1.5KB = 300KB Total IndexedDB usage: ~2.7MB  Cached models (browser cache storage):   all-MiniLM-L6-v2: 25MB   Moondream2 (optional): 1.8GB
+8. Error Handling & Resilience
+Failure ModeBehaviourGraphQL response shape changesisSavedReelsResponse() returns false, reel silently skipped. No crash.CC file fetch fails / 404transcript = null. Reel still indexed with other layers.Vision model not downloadedvisualDescription = null. All other search still works.Embedding model unavailableSearch falls back to keyword matching on stored document text.IndexedDB quota exceededOldest Tier 1 documents demoted to Tier 2 before writing new ones.Duplicate reel encounteredExisting record updated with any newly available enrichment (e.g. new CC data).

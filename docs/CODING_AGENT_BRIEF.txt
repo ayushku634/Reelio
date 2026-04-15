@@ -1,0 +1,74 @@
+
+??
+Reelio
+Coding Agent Brief
+Version 1.0 · BRIEF
+Reelio Chrome Extension
+
+
+What You Are Building
+A Chrome Extension called Reelio. It intercepts Instagram's internal API calls to capture saved reels from https://www.instagram.com/ayush.hs26/saved/all-posts/, enriches each reel with a spoken transcript and metadata, stores everything locally in IndexedDB, and lets the user search their saved reels using natural language via a popup UI.
+
+The Single Most Important Thing
+Everything runs locally in the browser. No backend. No API keys. No external database. Zero cost to run. All AI models run via WebAssembly in Web Workers.
+The Most Critical Implementation Detail - Read Before Anything Else
+3-Layer Interception Architecture - Non-Negotiable
+Chrome MV3 content scripts run in an ISOLATED JavaScript world. They CANNOT patch window.fetch as Instagram sees it. A common mistake is trying to patch fetch directly in content.js - this silently fails.  The CORRECT 3-layer approach:  LAYER 1 - public/page-interceptor.js   • A static JS file declared in web_accessible_resources   • Patches window.fetch and XMLHttpRequest in Instagram's JS context   • Dispatches CustomEvent("reelioApi", { detail: { url, body, status } })   • Has idempotency guard: if (window.__reelioInterceptor) return;  LAYER 2 - content.js   • Runs at document_start   • Injects page-interceptor.js via: script.src = chrome.runtime.getURL("public/page-interceptor.js")   • Listens: window.addEventListener("reelioApi", evt => chrome.runtime.sendMessage(...))   • NO business logic - pure relay  LAYER 3 - background.js (Service Worker)   • Receives { type: "API_PAYLOAD", payload: { url, body } }   • Parses body as JSON, fingerprints, deduplicates, runs pipeline  Do NOT skip or merge any layer.
+Documents to Read First
+Read these documents in this order before writing any code:
+1. PRD.docx - what the product does, user flows, requirements
+2. SYSTEM_DESIGN.docx - data models, data flow, component responsibilities
+3. ARCHITECTURE.docx - file structure, manifest, module specs, message protocols
+4. PHASE_ROADMAP.docx - build in 4 phases, verify each before proceeding
+
+Phase Execution Rules
+• Complete Phase 1 fully and pass its verification checklist before starting Phase 2
+• Complete Phase 2 fully and pass its verification checklist before starting Phase 3
+• Complete Phase 3 fully and pass its verification checklist before starting Phase 4
+• Each phase produces a working, installable extension build
+• Do not refactor earlier phases when building later phases unless a bug requires it
+
+Absolute Constraints
+ConstraintDetailNo backendDo not create any server, API endpoint, or cloud function. Everything is client-side.No paid APIsDo not use OpenAI, Anthropic, Google Cloud Vision, or any paid service.No localStorageUse IndexedDB for reel data. Use chrome.storage.local for user settings only.No DOM injectionDo not inject any UI elements into Instagram pages. Popup only.No video downloadOnly fetch thumbnail images and .vtt caption text files. Never the video itself.No hardcoded IDsDo not hardcode Instagram's GraphQL doc_id. Use structural response fingerprinting.Silent failureThe extension must never break Instagram. All interception errors are silently caught.3-layer interceptionNEVER patch fetch directly in content.js. Always use page-interceptor.js injected into page context.
+Models & Libraries
+Model / LibraryWhere UsedSizeHow Loaded@xenova/transformersembedding-worker.js~800KB JSnpm bundle via webpackall-MiniLM-L6-v2embedding-worker.js25MB weightsHuggingFace CDN, cached after first downloadMoondream2vision-worker.js1.8GB weightsOpt-in, streamed with progress, cached
+The Enrichment Pipeline (Phase 2 Core)
+For each intercepted reel, run these steps in order. Each step is independent and fails gracefully:
+
+StepModuleOutput FieldFailure Behaviour1. Parse GraphQLinterceptor.jsraw reel objectReturn [] - skip entire reel2. Fetch CC filecc-fetcher.jstranscript: stringtranscript = null - continue3. Tag metadatametadata-tagger.jscategories, audioSignalcategories = ["Unknown"] - continue4. Build documentdocument-builder.jsReelDocumentLog error, skip reel5. Store documentdb.js + tier-manager.jsIndexedDB writeLog error, skip reel6. Compute embeddingembedding-worker.jsEmbeddingRecordLog error, reel stored but not searchable7. Vision (async)vision-worker.jsvisualDescription: stringvisualDescription = null - continue
+Popup UI Spec
+The popup should be 380px wide. Clean, minimal, dark-friendly. Three views:
+
+View 1: Search (default)
+• Search input - full width, autofocused on popup open
+• Top N selector - segmented control: [3] [5] [10] [20]
+• Result cards - thumbnail (64×64), creator handle, caption snippet (1 line, truncated), category badge, score %, Open button
+• Below main results: "N partial matches from older reels" expandable section
+• Empty state: "Go to instagram.com/ayush.hs26/saved/all-posts/ and scroll to start indexing"
+
+View 2: Loading (first launch only)
+• "Setting up search engine" progress bar (25MB model download)
+• Shown once, never again after model is cached
+
+View 3: Settings (gear icon)
+• Full context reels: slider 50-500, current value shown
+• Storage used: "3.4 MB used"
+• Visual search: toggle (off by default, shows 1.8GB warning on enable)
+• Vision queue: "8 reels queued for visual analysis" (only shown when queue > 0)
+• [Clear All Data] - red button, confirmation required
+
+Quick Reference: IndexedDB Stores
+StorekeyPathKey Fieldsreel_documentsidid, url, thumbnailUrl, creator, caption, hashtags, audio, transcript, visualDescription, categories, savedAt, indexedAt, tier:1reel_tombstonesidid, url, thumbnailUrl, creatorUsername, categories, savedAt, tier:2embeddingsidid, vector (Float32Array), textUsedsettingskeykey, value - stores: tierLimit, visionEnabled, topN, onboardingDone
+Quick Reference: Message Types
+TypeFlowKey Payload FieldsAPI_PAYLOADcontent ? background{ url: string, body: string, status: number } - raw intercepted responseSEARCHpopup ? backgroundquery: string, topN: numberSEARCH_RESULTSbackground ? popupresults: {document, score}[], partial: TombstoneResult[]GET_STATSpopup ? background(empty)STATSbackground ? popuptotal: number, tier1: number, storageBytes: number, visionQueue: numberUPDATE_SETTINGSpopup ? backgroundtierLimit?: number, visionEnabled?: boolean, topN?: number
+Definition of Done
+The project is complete when all of the following are true:
+• All 4 phase verification checklists pass
+• User can navigate to instagram.com/ayush.hs26/saved/all-posts/, scroll, and see badge count increment
+• User can type "morning routine journaling" and find the correct reel
+• User can type "guy making pasta outdoor" and find the correct reel
+• Extension works after Chrome restart - data persists
+• Extension does not cause any errors on Instagram pages
+• All unit tests pass
+• Extension package builds cleanly with npm run build
+• Installed unpacked in Chrome with no warnings in chrome://extensions

@@ -1,0 +1,116 @@
+
+??
+Reelio
+Product Requirements Document
+Version 1.0 · PRD
+Reelio Chrome Extension
+
+
+1. Product Overview
+Reelio is a Chrome extension that silently indexes a user's Instagram Saved Reels as they browse, building a rich searchable database using transcripts, visual frame analysis, and metadata. Users can then find any saved reel using natural language prompts - no API keys, no subscriptions, no cost.
+
+Problem Statement
+Instagram provides no native search over saved reels. A user who saves hundreds of reels has no way to find "that morning routine reel with the journaling part" without scrolling endlessly through their saved folder. The saved content becomes practically inaccessible over time.
+1.1 Goals
+• Enable natural language search over all saved Instagram Reels
+• Zero cost to user - no API keys, no subscriptions, no sign-up
+• Zero cost to developer after initial build - no backend, no servers
+• Private by design - all data stays in the user's browser
+• Works passively - user just scrolls their saved folder normally
+
+1.2 Non-Goals
+• This product does NOT support search over the general Instagram feed
+• This product does NOT support video platforms other than Instagram
+• This product does NOT require or use any Instagram API credentials
+• This product does NOT sync data across devices (v1)
+• This product does NOT include comment mining or social context
+
+
+2. Target User
+A single target persona: the person who saves Instagram Reels regularly for reference - recipes, workouts, tutorials, productivity tips, aesthetic inspiration - and is frustrated that they cannot find specific reels later.
+
+AttributeDescriptionPlatformChrome on Desktop (primary), Edge/Brave (secondary via same extension)BehaviourSaves 5-30 reels per week across multiple categoriesPain PointCannot find saved reels later without endless scrollingTechnical levelNon-technical - installs extensions, expects things to just workPrivacy concernModerate - prefers local storage over cloud services
+
+3. Features & Requirements
+3.1 Data Collection (Must Have)
+• Extension intercepts Instagram GraphQL responses on instagram.com
+• Interception triggers automatically when user opens their Saved Reels folder
+• No user action required beyond normal scrolling
+• Data is collected silently with no visible interruption to Instagram browsing
+• Collection indicator: badge on extension icon shows count of indexed reels
+
+3.2 Context Extraction (Must Have)
+• Layer 1: Full spoken transcript extracted from Instagram's auto-generated CC (.vtt) file
+• Layer 2: Visual description of 3 frames (cover, mid, late) via local Moondream2 vision model
+• Layer 3: Rule-based metadata enrichment - category tagging, audio signal analysis, hashtag scoring
+• Each layer degrades gracefully - if CC file missing, skip it; if vision model not downloaded, skip it
+
+3.3 Storage (Must Have)
+• All data stored in browser IndexedDB - no external servers
+• Tiered storage: full context for N most recent reels (user-configurable), lightweight tombstone for all others
+• Default N = 200 reels
+• User can adjust N from 50 to 500 via settings slider
+• Storage meter displayed in settings panel
+• User can clear all data with one click
+
+3.4 Semantic Search (Must Have)
+• Search powered by all-MiniLM-L6-v2 model via transformers.js (25MB, one-time download)
+• Model runs entirely in browser Web Worker - no network calls at search time
+• Embeddings computed at index time, stored in IndexedDB alongside documents
+• Query embedded at search time, cosine similarity computed in JS
+• Results ranked by similarity score, displayed with percentage match
+• Search is live - results update as user types (300ms debounce)
+
+3.5 Result Control (Must Have)
+• User selects how many top results to show: 3 / 5 / 10 / 20
+• Selection persists across sessions
+• Tier 2 (lightweight) matches shown separately below Tier 1 results
+
+3.6 UI (Must Have)
+• Extension popup accessible from Chrome toolbar
+• Search bar at top of popup
+• Each result shows: thumbnail, creator handle, caption snippet, category tag, match score, Open button
+• Open button navigates directly to the reel on Instagram
+• Settings panel (gear icon) contains: N slider, storage meter, clear data, vision model toggle
+
+3.7 Vision Model (Nice to Have - Opt-In)
+• Moondream2 (1.8GB) downloaded on first use only after explicit user consent
+• Prompt shown on first launch: "Enable visual search? Downloads 1.8GB once."
+• If declined, extension works with transcript + metadata only
+• Processing runs in background Web Worker queue - never blocks UI
+
+
+4. User Flows
+4.1 First-Time Setup
+1. User installs extension from Chrome Web Store
+2. Popup opens automatically with welcome screen
+3. User prompted: "Enable visual search? (1.8GB one-time download)" - Yes / Skip
+4. Embedding model (25MB) downloads silently in background
+5. Onboarding message: "Go to instagram.com, open your Saved folder and scroll to start indexing"
+
+4.2 Indexing Flow
+6. User navigates to instagram.com/ayush.hs26/saved/all-posts/
+7. User scrolls through their saved reels folder
+8. Extension intercepts each GraphQL batch response silently
+9. For each reel: fetch CC file, extract metadata, run enrichment pipeline
+10. If vision enabled: queue reel for frame analysis in Web Worker
+11. Badge on extension icon increments: "247"
+
+4.3 Search Flow
+12. User clicks extension icon - popup opens
+13. User types query: "morning routine no phone cortisol"
+14. After 300ms debounce, query is embedded locally
+15. Cosine similarity computed against all stored vectors
+16. Top N results rendered with thumbnails, snippets, scores
+17. User clicks [Open] on a result - navigates to reel on Instagram
+
+
+5. Constraints & Principles
+ConstraintRequirementCost to userZero - no API keys, no paid servicesCost to developerZero ongoing - no backend, no hostingPrivacyAll data stays in browser IndexedDB, never leaves deviceInstagram ToSExtension operates on user's own saved content onlyOffline capabilitySearch works fully offline after initial model downloadPerformanceSearch must return results in under 500ms for 500 reelsStorage budgetFull context: max 10MB. Tombstones: max 2MB.Model downloads25MB embedding model: silent. 1.8GB vision model: opt-in with consent.
+
+6. Success Metrics
+• User can find a specific reel using natural language in under 30 seconds
+• Search recall: correct reel appears in top 5 results for 80%+ of queries
+• Indexing is seamless - user notices no change to normal Instagram browsing
+• Zero crashes or data loss across browser sessions
+• Extension passes Chrome Web Store review on first submission
