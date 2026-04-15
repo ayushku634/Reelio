@@ -32,9 +32,9 @@ export function extractReels(json) {
         const node = item.node || item.media || item;
         const media = node.media || node;
         
-        // Relax check to log everything that has an ID or shortcode
-        if (media && (media.shortcode || media.code || media.id || media.pk)) {
-          console.log("[Reelio Debug] Parsing candidate media:", media.shortcode || media.code);
+        // Must have an actual shortcode/code to be a valid Reel/Post
+        if (media && (media.shortcode || media.code)) {
+          // console.log("[Reelio Debug] Parsing candidate media:", media.shortcode || media.code);
           const reel = {
             id: media.id || media.pk,
             shortcode: media.shortcode || media.code,
